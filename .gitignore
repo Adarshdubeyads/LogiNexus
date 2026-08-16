@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+potholes.db
+potholes.db-wal
+potholes.db-shm
+uploads/*.jpg
+!uploads/.gitkeep
