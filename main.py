@@ -2,8 +2,6 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import io
 import gc
@@ -38,7 +36,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 DB_PATH = "potholes.db"
 yolo_model = None
-INFERENCE_BUSY = False
+inference_lock = asyncio.Lock()
 
 COCO_REJECT_CLASSES = {
     'person', 'face', 'cell phone', 'chair', 'bottle', 'cup', 'laptop',
@@ -50,9 +48,9 @@ COCO_REJECT_CLASSES = {
 SYSTEM_SETTINGS = {
     "consensus_radius_m": 15.0,
     "vibration_threshold_g": 1.7,
-    "yolo_direct_threshold": 0.65,
-    "yolo_min_threshold": 0.30,
-    "telemetry_interval_ms": 300,
+    "yolo_direct_threshold": 0.50,
+    "yolo_min_threshold": 0.25,
+    "telemetry_interval_ms": 600,
     "default_map_layer": "dark"
 }
 
@@ -140,16 +138,6 @@ def init_db():
         for k, v in SYSTEM_SETTINGS.items():
             cur.execute("INSERT OR IGNORE INTO system_settings VALUES (?, ?)", (k, str(v)))
 
-        cur.execute("PRAGMA table_info(detection_logs)")
-        dl_cols = [c[1] for c in cur.fetchall()]
-        if 'speed' not in dl_cols and len(dl_cols) > 0:
-            cur.execute("ALTER TABLE detection_logs ADD COLUMN speed REAL DEFAULT 0.0")
-
-        cur.execute("PRAGMA table_info(defects)")
-        def_cols = [c[1] for c in cur.fetchall()]
-        if 'speed' not in def_cols and len(def_cols) > 0:
-            cur.execute("ALTER TABLE defects ADD COLUMN speed REAL DEFAULT 0.0")
-
         conn.commit()
     finally:
         conn.close()
@@ -162,7 +150,7 @@ try:
     from ultralytics import YOLO
     model_path = "best.pt" if os.path.exists("best.pt") else "yolov8n.pt"
     yolo_model = YOLO(model_path, task="detect")
-    print(f"[ML ENGINE] Low-RAM Engine Initialized: {model_path}")
+    print(f"[ML ENGINE] Model ready: {model_path} | Classes: {yolo_model.names}")
 except Exception as e:
     print(f"[ERROR] ML load failed: {e}")
 
@@ -195,16 +183,6 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
     a = max(0.0, min(1.0, a))
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a)))
-
-def is_human_skin_or_face(crop_bgr: np.ndarray) -> bool:
-    if crop_bgr is None or crop_bgr.size == 0:
-        return False
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    lower_skin = np.array([0, 30, 60], dtype=np.uint8)
-    upper_skin = np.array([25, 255, 255], dtype=np.uint8)
-    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
-    skin_ratio = np.sum(skin_mask > 0) / (crop_bgr.shape[0] * crop_bgr.shape[1] + 1e-5)
-    return skin_ratio > 0.40
 
 def classify_vibration(ax: float, ay: float, az: float, speed: float, threshold_g: float) -> dict:
     vertical_spike_ms2 = abs(az - 9.81)
@@ -242,20 +220,10 @@ def classify_vibration(ax: float, ay: float, az: float, speed: float, threshold_
     }
 
 def run_model_inference(img_bytes: bytes, min_conf: float):
-    global INFERENCE_BUSY
-    if INFERENCE_BUSY:
-        return [], None
-    
-    INFERENCE_BUSY = True
     detections = []
     image = None
     try:
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        image.thumbnail((320, 320))
-        np_img = np.array(image)
-        np_bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
-        frame_h, frame_w, _ = np_bgr.shape
-        
         if yolo_model:
             results = yolo_model.predict(source=image, conf=min_conf, imgsz=320, verbose=False)
             for r in results:
@@ -268,24 +236,12 @@ def run_model_inference(img_bytes: bytes, min_conf: float):
                         continue
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    bw = x2 - x1
-                    bh = y2 - y1
-
-                    if bh > (bw * 1.35) or y1 < (frame_h * 0.15):
-                        continue
-
-                    crop = np_bgr[max(0, y1):min(frame_h, y2), max(0, x1):min(frame_w, x2)]
-                    if is_human_skin_or_face(crop):
-                        continue
-
-                    if conf >= min_conf:
-                        detections.append({
-                            "x": x1, "y": y1,
-                            "w": bw, "h": bh,
-                            "confidence": round(conf, 2)
-                        })
+                    detections.append({
+                        "x": x1, "y": y1,
+                        "w": x2 - x1, "h": y2 - y1,
+                        "confidence": round(conf, 2)
+                    })
     finally:
-        INFERENCE_BUSY = False
         gc.collect()
 
     return detections, image
@@ -328,8 +284,8 @@ def get_settings():
 def update_settings(
     consensus_radius_m: float = Form(15.0),
     vibration_threshold_g: float = Form(1.7),
-    yolo_direct_threshold: float = Form(0.65),
-    telemetry_interval_ms: int = Form(300),
+    yolo_direct_threshold: float = Form(0.50),
+    telemetry_interval_ms: int = Form(600),
     default_map_layer: str = Form("dark")
 ):
     SYSTEM_SETTINGS.update({
@@ -379,51 +335,10 @@ def delete_defect_log(ticket_id: str = Form(...)):
                         try: os.remove(dp)
                         except: pass
         
-        cur.execute("SELECT image_path FROM defects WHERE id = ?", (actual_ticket_id,))
-        d_row = cur.fetchone()
-        if d_row and d_row[0] and d_row[0].startswith("/uploads/"):
-            dp = d_row[0].lstrip("/")
-            if os.path.exists(dp):
-                try: os.remove(dp)
-                except: pass
-
         cur.execute("DELETE FROM defects WHERE id = ? OR id = ?", (actual_ticket_id, ticket_id))
         cur.execute("DELETE FROM detection_logs WHERE ticket_id = ? OR id = ?", (actual_ticket_id, ticket_id))
         conn.commit()
         return {"status": "SUCCESS", "deleted_ticket": actual_ticket_id}
-    finally:
-        conn.close()
-
-@app.post("/api/v1/logs/delete-batch")
-def delete_batch_logs(log_ids: str = Form(...)):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        id_list = [i.strip() for i in log_ids.split(",") if i.strip()]
-        if not id_list:
-            return {"status": "SUCCESS", "message": "No IDs provided."}
-        
-        placeholders = ",".join(["?"] * len(id_list))
-        cur.execute(f"SELECT ticket_id, image_path FROM detection_logs WHERE id IN ({placeholders})", id_list)
-        rows = cur.fetchall()
-        
-        ticket_ids_to_check = set()
-        for r in rows:
-            if r[0]: ticket_ids_to_check.add(r[0])
-            if r[1] and r[1].startswith("/uploads/"):
-                dp = r[1].lstrip("/")
-                if os.path.exists(dp):
-                    try: os.remove(dp)
-                    except: pass
-
-        cur.execute(f"DELETE FROM detection_logs WHERE id IN ({placeholders})", id_list)
-        if ticket_ids_to_check:
-            t_placeholders = ",".join(["?"] * len(ticket_ids_to_check))
-            cur.execute(f"DELETE FROM defects WHERE id IN ({t_placeholders})", list(ticket_ids_to_check))
-        cur.execute(f"DELETE FROM defects WHERE id IN ({placeholders})", id_list)
-
-        conn.commit()
-        return {"status": "SUCCESS", "deleted_count": len(id_list)}
     finally:
         conn.close()
 
@@ -450,10 +365,11 @@ async def process_telemetry(
     vibe_eval = classify_vibration(accel_x, accel_y, accel_z, speed, vibe_threshold)
 
     image_bytes = await file.read()
-    min_vision_conf = SYSTEM_SETTINGS.get("yolo_min_threshold", 0.30)
-    direct_conf = SYSTEM_SETTINGS.get("yolo_direct_threshold", 0.65)
+    min_vision_conf = SYSTEM_SETTINGS.get("yolo_min_threshold", 0.25)
+    direct_conf = SYSTEM_SETTINGS.get("yolo_direct_threshold", 0.50)
     
-    detections, image = await asyncio.to_thread(run_model_inference, image_bytes, min_vision_conf)
+    async with inference_lock:
+        detections, image = await asyncio.to_thread(run_model_inference, image_bytes, min_vision_conf)
     
     vision_detected = len(detections) > 0
     vision_conf = max([d["confidence"] for d in detections]) if vision_detected else 0.0
@@ -490,16 +406,8 @@ async def process_telemetry(
         }
 
     best_det = detections[0] if detections else {"w": 80, "h": 50, "confidence": fused_conf}
-    if vibe_eval["vertical_spike_g"] >= 2.5 or fused_conf >= 0.85 or best_det["w"] >= 95:
-        severity = "High"
-        diameter_cm = 75
-    elif vibe_eval["vertical_spike_g"] >= 1.6 or fused_conf >= 0.60 or best_det["w"] >= 45:
-        severity = "Medium"
-        diameter_cm = 45
-    else:
-        severity = "Low"
-        diameter_cm = 25
-
+    severity = "High" if vibe_eval["vertical_spike_g"] >= 2.5 or fused_conf >= 0.80 else ("Medium" if vibe_eval["vertical_spike_g"] >= 1.6 or fused_conf >= 0.50 else "Low")
+    diameter_cm = 75 if severity == "High" else (45 if severity == "Medium" else 25)
     area_m2 = math.pi * ((diameter_cm / 200.0) ** 2)
     asphalt_mt = round(area_m2 * 0.07 * 2.35 * 1.15 + 0.30, 2)
 
@@ -528,12 +436,8 @@ async def process_telemetry(
                     driver_list.append(driver_id)
                 final_drivers = driver_list
                 final_count = len(driver_list)
-                
-                if final_count >= 3:
-                    new_status = "AUTO_DISPATCHED_TO_NMC"
-                    auto_shared = True
-                else:
-                    new_status = r_status if "DISPATCH" in r_status else "CANDIDATE"
+                new_status = "AUTO_DISPATCHED_TO_NMC" if final_count >= 3 else (r_status if "DISPATCH" in r_status else "CANDIDATE")
+                auto_shared = (final_count >= 3)
 
                 cur.execute("""
                     UPDATE defects 
@@ -543,19 +447,8 @@ async def process_telemetry(
                 conn.commit()
                 break
 
-        is_recent_duplicate = False
-        if matched_id:
-            cur.execute("""
-                SELECT created_epoch FROM detection_logs 
-                WHERE ticket_id = ? AND driver_id = ? 
-                ORDER BY created_epoch DESC LIMIT 1
-            """, (matched_id, driver_id))
-            last_log = cur.fetchone()
-            if last_log and (time.time() - last_log[0] < 10.0):
-                is_recent_duplicate = True
-
         img_save_path = ""
-        if not is_recent_duplicate and image is not None:
+        if image is not None:
             filename = f"defect_{now.strftime('%Y%m%d_%H%M%S')}_{driver_id}.jpg"
             img_save_path = f"/uploads/{filename}"
             image.save(os.path.join(UPLOAD_DIR, filename), "JPEG", quality=65)
@@ -575,33 +468,26 @@ async def process_telemetry(
             ))
             conn.commit()
 
-        log_id = None
-        if not is_recent_duplicate:
-            log_id = f"LOG-{int(time.time() * 1000) % 1000000}"
-            cur.execute("""
-                INSERT INTO detection_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                log_id, matched_id, ts_str, time.time(),
-                latitude, longitude, speed, round(fused_conf, 2),
-                severity, confirmed_by, img_save_path, driver_id, final_count
-            ))
-            conn.commit()
+        log_id = f"LOG-{int(time.time() * 1000) % 1000000}"
+        cur.execute("""
+            INSERT INTO detection_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            log_id, matched_id, ts_str, time.time(),
+            latitude, longitude, speed, round(fused_conf, 2),
+            severity, confirmed_by, img_save_path, driver_id, final_count
+        ))
+        conn.commit()
     finally:
         conn.close()
 
     return {
         "status": "SUCCESS",
         "ticket_id": matched_id,
-        "log_id": log_id,
-        "is_new_log": not is_recent_duplicate,
         "severity": severity,
         "confidence": round(fused_conf, 2),
         "vibration_class": confirmed_by,
         "asphalt_quota_mt": asphalt_mt,
-        "box_size": f"{best_det['w']}x{best_det['h']} px",
-        "diameter_cm": diameter_cm,
         "consensus_count": final_count,
-        "drivers_list": final_drivers,
         "is_verified": final_count >= 3,
         "auto_dispatched_to_municipal": auto_shared,
         "image_url": img_save_path,
@@ -611,73 +497,8 @@ async def process_telemetry(
         "detections": detections
     }
 
-@app.post("/api/v1/manual-report")
-async def process_manual_report(
-    file: UploadFile = File(...),
-    latitude: float = Form(21.1458),
-    longitude: float = Form(79.0882),
-    driver_id: str = Form("driver1"),
-    notes: str = Form(""),
-    target_dept: str = Form("Municipal Corporation")
-):
-    image_bytes = await file.read()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image.thumbnail((480, 480))
-    
-    detections, _ = run_model_inference(image_bytes, 0.30)
-    best_det = detections[0] if detections else {"w": 140, "h": 95, "confidence": 0.85}
-    severity = "High" if best_det["w"] > 70 or best_det["confidence"] > 0.70 else "Medium"
-    diameter_cm = 75 if severity == "High" else 45
-    asphalt_mt = round(math.pi * ((diameter_cm / 200.0) ** 2) * 0.07 * 2.35 * 1.15 + 0.30, 2)
-
-    now = datetime.now()
-    ts_str = now.strftime("%d %b %Y, %I:%M %p")
-    filename = f"manual_{now.strftime('%Y%m%d_%H%M%S')}_{driver_id}.jpg"
-    img_save_path = f"/uploads/{filename}"
-    image.save(os.path.join(UPLOAD_DIR, filename), "JPEG", quality=70)
-
-    ticket_id = f"MNC-{int(time.time()) % 100000}"
-    location_tag = f"GPS {latitude:.5f}N, {longitude:.5f}E"
-
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO defects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ticket_id, ts_str, time.time(), now.strftime("%Y-%m-%d"), 1,
-            latitude, longitude, 0.0, best_det["confidence"],
-            best_det["w"], best_det["h"], severity, diameter_cm, asphalt_mt,
-            "MANUAL_PHOTO", img_save_path,
-            3, json.dumps([driver_id]), "AUTO_DISPATCHED_TO_NMC",
-            location_tag, notes, driver_id
-        ))
-        
-        log_id = f"LOG-{int(time.time() * 1000) % 1000000}"
-        cur.execute("""
-            INSERT INTO detection_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            log_id, ticket_id, ts_str, time.time(),
-            latitude, longitude, 0.0, best_det["confidence"],
-            severity, "MANUAL_DISPATCH", img_save_path, driver_id, 3
-        ))
-        conn.commit()
-    finally:
-        conn.close()
-
-    return {
-        "status": "SUCCESS",
-        "ticket_id": ticket_id,
-        "severity": severity,
-        "asphalt_quota_mt": asphalt_mt,
-        "image_url": img_save_path,
-        "location": location_tag,
-        "timestamp": ts_str,
-        "message": f"Dispatched to {target_dept}!"
-    }
-
 @app.get("/api/v1/potholes")
-def get_potholes(day_offset: Optional[int] = None, severity: str = "ALL", driver_id: Optional[str] = None):
+def get_potholes(severity: str = "ALL"):
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -702,94 +523,23 @@ def get_potholes(day_offset: Optional[int] = None, severity: str = "ALL", driver
     finally:
         conn.close()
 
-@app.get("/api/v1/history")
-def get_history(max_days: int = 30, driver_id: Optional[str] = None):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        query = "SELECT * FROM defects WHERE day_offset <= ? ORDER BY created_epoch DESC"
-        cur.execute(query, [max_days])
-        rows = cur.fetchall()
-        return {
-            "max_days": max_days,
-            "count": len(rows),
-            "history": [{
-                "id": r[0], "timestamp": r[1], "date_str": r[3], "day_offset": r[4],
-                "latitude": r[5], "longitude": r[6], "speed": r[7], "severity": r[11], "diameter_cm": r[12],
-                "asphalt_quota": r[13], "vibration_class": r[14], "image_url": r[15],
-                "consensus_count": r[16], "drivers_list": json.loads(r[17]), "status": r[18],
-                "location_name": r[19], "notes": r[20], "driver_id": r[21]
-            } for r in rows]
-        }
-    finally:
-        conn.close()
-
-@app.get("/api/v1/logs")
-def get_all_detection_logs(driver_id: Optional[str] = None):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, ticket_id, timestamp, created_epoch, latitude, longitude, speed, confidence, severity, trigger_source, image_path, driver_id, consensus_count FROM detection_logs ORDER BY created_epoch DESC")
-        rows = cur.fetchall()
-        return {
-            "count": len(rows),
-            "logs": [{
-                "id": r[0],
-                "ticket_id": r[1],
-                "timestamp": r[2],
-                "latitude": r[4],
-                "longitude": r[5],
-                "speed": r[6],
-                "confidence": r[7],
-                "severity": r[8],
-                "vibration_class": r[9],
-                "image_url": r[10],
-                "driver_id": r[11],
-                "consensus_count": r[12]
-            } for r in rows]
-        }
-    finally:
-        conn.close()
-
 @app.get("/api/v1/analytics")
 def get_analytics():
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT severity, vibration_class, asphalt_quota, status, date_str FROM defects")
+        cur.execute("SELECT severity, asphalt_quota, status FROM defects")
         rows = cur.fetchall()
-
         counts = {"High": 0, "Medium": 0, "Low": 0}
-        asphalt_by_sev = {"High": 0.0, "Medium": 0.0, "Low": 0.0}
-        status_counts = {"AUTO_DISPATCHED": 0, "CREW_DISPATCHED": 0, "RESOLVED": 0, "CANDIDATE": 0}
         total_asphalt = 0.0
-        active_penalties = 0
-
         for r in rows:
-            sev, v_class, asp, stat, d_str = r
+            sev, asp, stat = r
             if stat not in ["RESOLVED", "DISMISSED"]:
-                if sev in counts:
-                    counts[sev] += 1
-                    asphalt_by_sev[sev] += asp
+                if sev in counts: counts[sev] += 1
                 total_asphalt += asp
-                active_penalties += (12 if sev == "High" else (6 if sev == "Medium" else 2))
-
-            if "DISPATCH" in stat or "AUTO" in stat:
-                status_counts["AUTO_DISPATCHED"] += 1
-            elif stat in ["CREW_DISPATCHED", "IN_PROGRESS"]:
-                status_counts["CREW_DISPATCHED"] += 1
-            elif stat in ["RESOLVED", "REPAIRED"]:
-                status_counts["RESOLVED"] += 1
-            else:
-                status_counts["CANDIDATE"] += 1
-
-        dynamic_score = max(10, 100 - active_penalties)
-
         return {
-            "dynamic_road_score": dynamic_score,
+            "dynamic_road_score": max(10, 100 - (counts["High"]*12 + counts["Medium"]*6 + counts["Low"]*2)),
             "severity_distribution": counts,
-            "asphalt_by_severity": {k: round(v, 2) for k, v in asphalt_by_sev.items()},
-            "status_distribution": status_counts,
             "total_asphalt_mt": round(total_asphalt, 2),
             "total_active": sum(counts.values())
         }
