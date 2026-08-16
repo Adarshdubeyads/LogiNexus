@@ -1,5 +1,12 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import io
+import gc
 import math
 import time
 import json
@@ -31,6 +38,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 DB_PATH = "potholes.db"
 yolo_model = None
+INFERENCE_BUSY = False
 
 COCO_REJECT_CLASSES = {
     'person', 'face', 'cell phone', 'chair', 'bottle', 'cup', 'laptop',
@@ -58,7 +66,6 @@ def init_db():
     conn = get_db()
     try:
         cur = conn.cursor()
-        
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -150,11 +157,12 @@ def init_db():
 init_db()
 
 try:
+    import torch
+    torch.set_num_threads(1)
     from ultralytics import YOLO
-    model_path = "best.onnx" if os.path.exists("best.onnx") else ("best.pt" if os.path.exists("best.pt") else "yolov8n.pt")
+    model_path = "best.pt" if os.path.exists("best.pt") else "yolov8n.pt"
     yolo_model = YOLO(model_path, task="detect")
-    yolo_model.predict(np.zeros((320, 320, 3), dtype=np.uint8), imgsz=320, verbose=False)
-    print(f"[ML ENGINE] Model ready: {model_path} | Classes: {yolo_model.names}")
+    print(f"[ML ENGINE] Low-RAM Engine Initialized: {model_path}")
 except Exception as e:
     print(f"[ERROR] ML load failed: {e}")
 
@@ -234,43 +242,52 @@ def classify_vibration(ax: float, ay: float, az: float, speed: float, threshold_
     }
 
 def run_model_inference(img_bytes: bytes, min_conf: float):
-    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    np_img = np.array(image)
-    np_bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
-    frame_h, frame_w, _ = np_bgr.shape
+    global INFERENCE_BUSY
+    if INFERENCE_BUSY:
+        return [], None
     
+    INFERENCE_BUSY = True
     detections = []
-    if yolo_model:
-        results = yolo_model.predict(source=image, conf=min_conf, imgsz=320, verbose=False)
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = str(yolo_model.names.get(cls_id, cls_id)).lower()
-                conf = float(box.conf[0])
-                
-                if cls_name in COCO_REJECT_CLASSES:
-                    continue
+    image = None
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image.thumbnail((320, 320))
+        np_img = np.array(image)
+        np_bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+        frame_h, frame_w, _ = np_bgr.shape
+        
+        if yolo_model:
+            results = yolo_model.predict(source=image, conf=min_conf, imgsz=320, verbose=False)
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    cls_name = str(yolo_model.names.get(cls_id, cls_id)).lower()
+                    conf = float(box.conf[0])
+                    
+                    if cls_name in COCO_REJECT_CLASSES:
+                        continue
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                bw = x2 - x1
-                bh = y2 - y1
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    bw = x2 - x1
+                    bh = y2 - y1
 
-                if bh > (bw * 1.35):
-                    continue
+                    if bh > (bw * 1.35) or y1 < (frame_h * 0.15):
+                        continue
 
-                if y1 < (frame_h * 0.15):
-                    continue
+                    crop = np_bgr[max(0, y1):min(frame_h, y2), max(0, x1):min(frame_w, x2)]
+                    if is_human_skin_or_face(crop):
+                        continue
 
-                crop = np_bgr[max(0, y1):min(frame_h, y2), max(0, x1):min(frame_w, x2)]
-                if is_human_skin_or_face(crop):
-                    continue
+                    if conf >= min_conf:
+                        detections.append({
+                            "x": x1, "y": y1,
+                            "w": bw, "h": bh,
+                            "confidence": round(conf, 2)
+                        })
+    finally:
+        INFERENCE_BUSY = False
+        gc.collect()
 
-                if conf >= min_conf:
-                    detections.append({
-                        "x": x1, "y": y1,
-                        "w": bw, "h": bh,
-                        "confidence": round(conf, 2)
-                    })
     return detections, image
 
 @app.get("/")
@@ -538,10 +555,10 @@ async def process_telemetry(
                 is_recent_duplicate = True
 
         img_save_path = ""
-        if not is_recent_duplicate:
+        if not is_recent_duplicate and image is not None:
             filename = f"defect_{now.strftime('%Y%m%d_%H%M%S')}_{driver_id}.jpg"
             img_save_path = f"/uploads/{filename}"
-            image.save(os.path.join(UPLOAD_DIR, filename), "JPEG", quality=75)
+            image.save(os.path.join(UPLOAD_DIR, filename), "JPEG", quality=65)
 
         if not matched_id:
             matched_id = f"LN-{int(time.time()) % 100000}"
@@ -569,7 +586,6 @@ async def process_telemetry(
                 severity, confirmed_by, img_save_path, driver_id, final_count
             ))
             conn.commit()
-            print(f"[{driver_id}] => LOGGED POTHOLE: {matched_id} [{severity}] ({confirmed_by}) GPS: {latitude:.5f}, {longitude:.5f} @ {speed} km/h")
     finally:
         conn.close()
 
@@ -606,6 +622,7 @@ async def process_manual_report(
 ):
     image_bytes = await file.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image.thumbnail((480, 480))
     
     detections, _ = run_model_inference(image_bytes, 0.30)
     best_det = detections[0] if detections else {"w": 140, "h": 95, "confidence": 0.85}
@@ -617,7 +634,7 @@ async def process_manual_report(
     ts_str = now.strftime("%d %b %Y, %I:%M %p")
     filename = f"manual_{now.strftime('%Y%m%d_%H%M%S')}_{driver_id}.jpg"
     img_save_path = f"/uploads/{filename}"
-    image.save(os.path.join(UPLOAD_DIR, filename), "JPEG")
+    image.save(os.path.join(UPLOAD_DIR, filename), "JPEG", quality=70)
 
     ticket_id = f"MNC-{int(time.time()) % 100000}"
     location_tag = f"GPS {latitude:.5f}N, {longitude:.5f}E"
