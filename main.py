@@ -36,6 +36,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 DB_PATH = "potholes.db"
 yolo_model = None
+ACTIVE_MODEL_NAME = "none"
 inference_lock = asyncio.Lock()
 
 COCO_REJECT_CLASSES = {
@@ -48,8 +49,8 @@ COCO_REJECT_CLASSES = {
 SYSTEM_SETTINGS = {
     "consensus_radius_m": 15.0,
     "vibration_threshold_g": 1.7,
-    "yolo_direct_threshold": 0.50,
-    "yolo_min_threshold": 0.25,
+    "yolo_direct_threshold": 0.25,
+    "yolo_min_threshold": 0.20,
     "telemetry_interval_ms": 600,
     "default_map_layer": "dark"
 }
@@ -148,9 +149,16 @@ try:
     import torch
     torch.set_num_threads(1)
     from ultralytics import YOLO
-    model_path = "best.pt" if os.path.exists("best.pt") else "yolov8n.pt"
+    if os.path.exists("best.pt"):
+        model_path = "best.pt"
+    elif os.path.exists("best.onnx"):
+        model_path = "best.onnx"
+    else:
+        model_path = "yolov8n.pt"
+    
     yolo_model = YOLO(model_path, task="detect")
-    print(f"[ML ENGINE] Model ready: {model_path} | Classes: {yolo_model.names}")
+    ACTIVE_MODEL_NAME = model_path
+    print(f"[ML ENGINE] Model active: {ACTIVE_MODEL_NAME} | Classes: {yolo_model.names}")
 except Exception as e:
     print(f"[ERROR] ML load failed: {e}")
 
@@ -224,6 +232,7 @@ def run_model_inference(img_bytes: bytes, min_conf: float):
     image = None
     try:
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image.thumbnail((480, 480))
         if yolo_model:
             results = yolo_model.predict(source=image, conf=min_conf, imgsz=320, verbose=False)
             for r in results:
@@ -239,7 +248,8 @@ def run_model_inference(img_bytes: bytes, min_conf: float):
                     detections.append({
                         "x": x1, "y": y1,
                         "w": x2 - x1, "h": y2 - y1,
-                        "confidence": round(conf, 2)
+                        "confidence": round(conf, 2),
+                        "label": cls_name
                     })
     finally:
         gc.collect()
@@ -249,6 +259,14 @@ def run_model_inference(img_bytes: bytes, min_conf: float):
 @app.get("/")
 def serve_home():
     return FileResponse("index.html")
+
+@app.get("/api/v1/diagnostics")
+def get_diagnostics():
+    return {
+        "active_model": ACTIVE_MODEL_NAME,
+        "best_pt_exists": os.path.exists("best.pt"),
+        "model_classes": yolo_model.names if yolo_model else {}
+    }
 
 @app.post("/api/v1/auth/login")
 def login(username: str = Form(...), pin: str = Form(...)):
@@ -284,7 +302,7 @@ def get_settings():
 def update_settings(
     consensus_radius_m: float = Form(15.0),
     vibration_threshold_g: float = Form(1.7),
-    yolo_direct_threshold: float = Form(0.50),
+    yolo_direct_threshold: float = Form(0.25),
     telemetry_interval_ms: int = Form(600),
     default_map_layer: str = Form("dark")
 ):
@@ -335,6 +353,14 @@ def delete_defect_log(ticket_id: str = Form(...)):
                         try: os.remove(dp)
                         except: pass
         
+        cur.execute("SELECT image_path FROM defects WHERE id = ?", (actual_ticket_id,))
+        d_row = cur.fetchone()
+        if d_row and d_row[0] and d_row[0].startswith("/uploads/"):
+            dp = d_row[0].lstrip("/")
+            if os.path.exists(dp):
+                try: os.remove(dp)
+                except: pass
+
         cur.execute("DELETE FROM defects WHERE id = ? OR id = ?", (actual_ticket_id, ticket_id))
         cur.execute("DELETE FROM detection_logs WHERE ticket_id = ? OR id = ?", (actual_ticket_id, ticket_id))
         conn.commit()
@@ -365,8 +391,8 @@ async def process_telemetry(
     vibe_eval = classify_vibration(accel_x, accel_y, accel_z, speed, vibe_threshold)
 
     image_bytes = await file.read()
-    min_vision_conf = SYSTEM_SETTINGS.get("yolo_min_threshold", 0.25)
-    direct_conf = SYSTEM_SETTINGS.get("yolo_direct_threshold", 0.50)
+    min_vision_conf = float(SYSTEM_SETTINGS.get("yolo_min_threshold", 0.20))
+    direct_conf = float(SYSTEM_SETTINGS.get("yolo_direct_threshold", 0.25))
     
     async with inference_lock:
         detections, image = await asyncio.to_thread(run_model_inference, image_bytes, min_vision_conf)
@@ -383,7 +409,7 @@ async def process_telemetry(
         fused_conf = vision_conf
         confirmed_by = f"DIRECT_VISION ({int(vision_conf*100)}%)"
 
-    elif vision_detected and vision_conf >= min_vision_conf and vibe_eval["is_anomaly"]:
+    elif vision_detected and vibe_eval["is_anomaly"]:
         is_pothole_confirmed = True
         fused_conf = round((vision_conf * 0.60) + (vibe_eval["confidence"] * 0.40), 2)
         confirmed_by = f"DUAL_SENSOR (Vis: {int(vision_conf*100)}% + Shock: {vibe_eval['vertical_spike_g']}G)"
@@ -402,11 +428,12 @@ async def process_telemetry(
             "driver_metrics": {"driver_id": driver.driver_id, "distance_km": round(driver.total_distance_km, 2)},
             "latency_ms": latency_ms,
             "vibration": vibe_eval,
-            "detections": detections
+            "detections": detections,
+            "model_in_use": ACTIVE_MODEL_NAME
         }
 
     best_det = detections[0] if detections else {"w": 80, "h": 50, "confidence": fused_conf}
-    severity = "High" if vibe_eval["vertical_spike_g"] >= 2.5 or fused_conf >= 0.80 else ("Medium" if vibe_eval["vertical_spike_g"] >= 1.6 or fused_conf >= 0.50 else "Low")
+    severity = "High" if vibe_eval["vertical_spike_g"] >= 2.5 or fused_conf >= 0.70 else ("Medium" if vibe_eval["vertical_spike_g"] >= 1.6 or fused_conf >= 0.40 else "Low")
     diameter_cm = 75 if severity == "High" else (45 if severity == "Medium" else 25)
     area_m2 = math.pi * ((diameter_cm / 200.0) ** 2)
     asphalt_mt = round(area_m2 * 0.07 * 2.35 * 1.15 + 0.30, 2)
@@ -477,6 +504,7 @@ async def process_telemetry(
             severity, confirmed_by, img_save_path, driver_id, final_count
         ))
         conn.commit()
+        print(f"[DETECTED] {matched_id} ({confirmed_by}) | Conf: {fused_conf}")
     finally:
         conn.close()
 
@@ -494,7 +522,8 @@ async def process_telemetry(
         "timestamp": ts_str,
         "latency_ms": latency_ms,
         "driver_metrics": {"driver_id": driver.driver_id, "distance_km": round(driver.total_distance_km, 2)},
-        "detections": detections
+        "detections": detections,
+        "model_in_use": ACTIVE_MODEL_NAME
     }
 
 @app.get("/api/v1/potholes")
@@ -543,34 +572,6 @@ def get_analytics():
             "total_asphalt_mt": round(total_asphalt, 2),
             "total_active": sum(counts.values())
         }
-    finally:
-        conn.close()
-
-@app.post("/api/v1/municipal/verify")
-def verify_municipal_action(
-    ticket_id: str = Form(...),
-    action: str = Form("DISPATCH"),
-    auth_token: Optional[str] = Header(None)
-):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT role FROM users WHERE token = ?", (auth_token,))
-        user_row = cur.fetchone()
-
-        if not user_row or user_row[0] != "municipal":
-            raise HTTPException(status_code=403, detail="Municipal Officer credentials required.")
-
-        status_map = {
-            "DISPATCH": "CREW_DISPATCHED",
-            "REPAIR": "RESOLVED",
-            "DISMISS": "DISMISSED"
-        }
-        new_status = status_map.get(action.upper(), "CREW_DISPATCHED")
-
-        cur.execute("UPDATE defects SET status = ? WHERE id = ?", (new_status, ticket_id))
-        conn.commit()
-        return {"status": "SUCCESS", "message": f"Defect {ticket_id} updated to {new_status}."}
     finally:
         conn.close()
 
